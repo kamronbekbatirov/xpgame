@@ -25,7 +25,7 @@
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "grammy": "1.38.4",
-    "openai": "^6.7.0",
+    "openai": "^6.35.0",
     "pg": "^8.11.3"
   },
   "devDependencies": {
