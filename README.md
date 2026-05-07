@@ -140,6 +140,131 @@ my-bots.uz {
 }
 ```
 
+---
+
+## For contributors / AI agents
+
+> A short technical orientation for anyone (human or AI) being handed this repo for the first time.
+
+### Mental model
+A **two-tier app**: a React + Vite mini-app that renders inside Telegram's WebApp container, and an Express server that handles the bot, the OpenAI calls, and the Postgres state. There is **one shared user identity** — the Telegram numeric ID. Everything the user does in the WebApp authenticates via `tg.initData` (HMAC of the user's session, signed by the bot token). The whole game economy (XP, levels, achievements, shop) is server-authoritative.
+
+### Project tree
+
+```
+src/                           Frontend (React 18 + Vite 7, Telegram WebApp host)
+├── components/
+│   ├── Dashboard.tsx          Home — XP, level, progress bar, quick actions
+│   ├── Today.tsx              "What's due today" view
+│   ├── Tasks.tsx              Full task list
+│   ├── TaskFeedback.tsx       Post-completion AI feedback
+│   ├── Goals.tsx              Goal CRUD
+│   ├── GoalChat.tsx           Per-goal AI chat (separate thread per goal)
+│   ├── OnboardingChat.tsx
+│   ├── OnboardingEnhanced.tsx
+│   ├── Profile.tsx · Me.tsx   Stats, level, settings
+│   ├── Achievements.tsx
+│   ├── Shop.tsx               Spend XP on rewards & boosters
+│   ├── Leaderboard.tsx
+│   ├── Budget.tsx             Real-world money tracker
+│   ├── UnifiedChat.tsx        One conversational surface for the coach
+│   ├── CountdownTimer.tsx     Reused for boosters + time-boxed tasks
+│   └── Login.tsx              Web-fallback login (when not opened from TG)
+
+server/                        Backend (Express, Postgres, grammy, OpenAI)
+├── index.js                   Bootstrap: registers routes, mounts bot, schedules sweepers
+├── bot.js                     grammy bot · /start /stats /help · web_app_data handler
+├── database.js                pg pool + query helpers
+├── models.js                  Users · Tasks · Achievements · XPHistory wrappers
+├── gamification.js            The XP + level + achievement engine (pure functions)
+├── openai-service.js          Responses API client (plan, motivation, chat)
+├── shop.js                    Catalog + purchase flow + active-booster state
+├── timer-checker.js           Background sweeper: expires boosters / rewards
+├── routes/
+│   ├── auth.js                initData verification, session issuance
+│   ├── budget.js              Budget tracker endpoints
+│   ├── onboarding.js          Onboarding chat flow
+│   ├── goal-chat.js           Per-goal chat endpoints
+│   ├── shop.js                Catalog · purchase · active items
+│   └── unified-chat.js        Coach surface
+├── schema.sql                 Initial schema (users, goals, weaknesses, tasks, …)
+├── migrations/                12 forward-only migrations (see list below)
+└── init-database.js           Bootstrap helper: applies schema.sql + every migration
+
+dist/                          Vite build output, served as static assets in prod
+```
+
+### Where things live
+
+| You want to … | Open … |
+| --- | --- |
+| Add a new screen / tab in the WebApp | A new component under `src/components/`, then route it from `Dashboard.tsx` |
+| Add a new HTTP endpoint | A handler in `server/index.js` (or inside `server/routes/<group>.js` if it groups thematically). Always run `requireAuth` first. |
+| Tweak XP curve, level math, achievement triggers | `server/gamification.js` — the entire economy is here as one class |
+| Change shop pricing or add booster types | `server/shop.js` and `add_shop_tables.sql` (or a new migration) |
+| Adjust a Claude/OpenAI prompt | `server/openai-service.js` — prompts live as template strings |
+| Run / regenerate the DB | `node server/init-database.js` (idempotent — schema + all migrations in order) |
+| Reset state in dev | `node server/clear-users.js` (DEV ONLY — wipes all users) |
+| Verify Telegram session in a request | `requireAuth` middleware in `server/routes/auth.js` |
+
+### Database schema (high level)
+
+```
+users               telegram_id (PK), username, total_xp, current_level,
+                    available_xp (spendable), streaks
+goals               user_id, title, category, priority (1-5), status, auto_generated
+weaknesses          user_id, title, description
+tasks               user_id, goal_id?, difficulty, xp_reward, status, refresh_tracker
+achievements        catalog
+user_achievements   (user_id, achievement_id) unlock log
+conversations       OpenAI Responses-API thread pointers (response_id) per surface
+xp_history          full audit trail: every grant, deduction, and reason
+shop_items          custom rewards + boosters
+user_purchases      who bought what, when
+user_active_boosters expiry-tracked timed effects
+motivation_cache    daily motivation messages
+personal_rewards_cache   rendered rewards
+```
+
+Twelve forward-only migrations track the platform's evolution:
+
+```
+add_auth_and_onboarding.sql   add_motivation_cache.sql      add_response_id_to_chat.sql
+add_available_xp.sql          add_personal_rewards_cache.sql add_reward_duration.sql
+add_budget_tracker.sql        add_roadmap_tasks.sql          add_task_refresh_tracker.sql
+add_goal_chat.sql             add_shop_tables.sql
+add_goals_auto_generate.sql
+```
+
+### Conventions and gotchas
+
+- ⚠️ **`tg.initData` is the only auth primitive.** Every WebApp → server request includes it; the server HMAC-verifies against `TELEGRAM_BOT_TOKEN`. There is no separate JWT/session cookie. `Login.tsx` exists only for the rare web-fallback case.
+- ⚠️ **OpenAI Responses API, not Chat Completions.** Every conversational surface persists a `response_id` in the `conversations` table so the model has continuity across sessions. When adding a new chat surface, follow `goal-chat.js` as the canonical example.
+- ⚠️ **The XP economy is server-authoritative.** Never compute `total_xp += reward` on the frontend — call the server, let `gamification.js` decide. The frontend only renders.
+- ⚠️ **Migrations are forward-only.** No down migrations exist. Adding a column is fine; deleting one requires a new migration that does it carefully (read the existing patterns first).
+- **`clear-users.js` is destructive.** It wipes the entire `users` table and cascades. Never run in production. Same goes for `clear-rewards.js`.
+- **Background sweepers run on the same Express process.** `timer-checker.js` is started from `index.js` on boot. If you scale to multiple instances, gate the sweeper or move it to a separate process — otherwise boosters expire multiple times.
+- **Vite dev runs on `:5173`, the API on `:3007`.** The WebApp is configured to call the API at `WEBAPP_URL` (set in `.env`), which in dev is the public URL of your Express server (typically a tunnel like ngrok, since Telegram needs HTTPS).
+- **Telegram Mini App constraints.** No `localStorage` for auth. No standard browser cookies. The WebApp container exposes `Telegram.WebApp.initData` — that's it.
+- **`OPENAI_PLAN_MODEL` defaults to `gpt-5`.** Costs scale fast; the motivation cache and `personal_rewards_cache` exist specifically to avoid hot-path token spend.
+
+### Run / build / deploy
+
+```bash
+# Database (one-shot)
+createdb xpgame_db
+cd server && node init-database.js
+
+# Backend
+cd server && cp .env.example .env && npm install && npm start    # :3007
+
+# Frontend (repo root)
+npm install && npm run dev                                       # :5173 (dev)
+npm run build                                                    # → dist/
+```
+
+Production: `dist/` served as static behind Caddy at `/xpgame`, API behind the same domain at `/xpgame/api`. See the *Production reference* block above.
+
 ## License
 
 [MIT](LICENSE)
